@@ -31,6 +31,23 @@ def find_video(folder: Path) -> Path | None:
 def build(videos_root: Path, out_csv: Path) -> None:
     rows = []
     skipped = 0
+
+    # Layout A: flat video files like 204049782_1100_1_A.mov
+    for vid in sorted(p for p in videos_root.iterdir()
+                      if p.is_file() and p.suffix.lower() in VIDEO_EXTS):
+        stem = vid.stem
+        label = parse_label(stem)
+        if label is None:
+            print(f"[skip] {vid.name}: cannot parse E/A label from stem")
+            skipped += 1
+            continue
+        rows.append({
+            "embryo_id": stem,
+            "label": label,
+            "video_path": str(vid.resolve()),
+        })
+
+    # Layout B: one folder per embryo, each containing a video
     for folder in sorted(p for p in videos_root.iterdir() if p.is_dir()):
         label = parse_label(folder.name)
         if label is None:
@@ -62,7 +79,7 @@ def build(videos_root: Path, out_csv: Path) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--videos-root", type=Path, required=True,
-                    help="Local directory containing one folder per embryo")
+                    help="Local directory of embryos (flat .mov files OR one folder per embryo)")
     ap.add_argument("--out", type=Path, default=Path("data/manifest.csv"))
     args = ap.parse_args()
     build(args.videos_root, args.out)
