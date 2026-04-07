@@ -1,0 +1,28 @@
+# Default config for euploid-dino-classifier
+
+data:
+  manifest: data/manifest.csv
+  features_dir: features
+  num_frames: 40           # frames sampled per clip
+  frame_stride: 10         # take every Nth frame; pad with black if clip too short
+  feature_dim: 384
+
+model:
+  d_model: 192
+  n_heads: 4
+  n_layers: 2
+  mlp_dim: 384
+  dropout: 0.3
+  num_classes: 2
+
+train:
+  epochs: 50
+  batch_size: 16
+  lr: 3.0e-4
+  weight_decay: 0.05
+  label_smoothing: 0.05
+  folds: 5
+  seed: 0
+  frame_dropout: 0.1       # prob of dropping a (non-pad) frame at train time
+  checkpoint_dir: checkpoints
+  log_dir: logs

@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+features/
+checkpoints/
+logs/
+data/manifest.csv
