@@ -6,7 +6,11 @@ For every row in manifest.csv:
      Pad with black frames if the clip is shorter than stride*N.
   3. Apply the same eval transform as dino_training/EmbryoFeatureDataset
      (Resize -> CenterCrop(crop_size) -> ImageNet normalize).
-  4. Forward through the frozen DINO **teacher** backbone.
+  4. Forward through the frozen DINO **teacher** backbone and collect features
+     according to --feature-source:
+       - cls          : layer-11 CLS token                              (384-d)
+       - patch_mean   : layer-11 patch tokens, mean-pooled              (384-d)
+       - multi_layer  : patch tokens at --layers, mean-pooled, concat   (384*L-d)
   5. Save {features, mask, label} to features/{embryo_id}.pt.
 
 Already-cached embryos are skipped, so this script is resumable.
@@ -25,12 +29,6 @@ from tqdm import tqdm
 import pandas as pd
 
 
-# ---------------------------------------------------------------------------
-# DINO loader — builds a bare ViT-S/16 backbone and loads teacher weights from
-# the dino_training checkpoint (which stores a MultiCropWrapper, so backbone
-# weights are prefixed "backbone." and head weights live under "head.").
-# ---------------------------------------------------------------------------
-
 def load_dino(dino_ckpt: Path, device: torch.device, img_size: int = 384):
     from dino_training.model import VisionTransformer  # type: ignore
 
@@ -43,23 +41,18 @@ def load_dino(dino_ckpt: Path, device: torch.device, img_size: int = 384):
     )
 
     ckpt = torch.load(dino_ckpt, map_location="cpu", weights_only=False)
-    # Prefer teacher (smoother features in DINO); fall back to student.
     raw = ckpt.get("teacher") or ckpt.get("student") or ckpt.get("state_dict") or ckpt
 
-    # Strip MultiCropWrapper / DDP prefixes; keep only backbone.* keys.
     state = {}
     for k, v in raw.items():
         nk = k.replace("module.", "")
         if nk.startswith("backbone."):
             state[nk[len("backbone."):]] = v
-        # head.* keys are dropped — we only need the encoder
 
     missing, unexpected = model.load_state_dict(state, strict=False)
     print(f"[dino] loaded {dino_ckpt.name} | "
           f"matched={len(state) - len(unexpected)} "
           f"missing={len(missing)} unexpected={len(unexpected)}")
-    if missing:
-        print(f"[dino] sample missing: {missing[:3]}")
 
     model.eval().to(device)
     for p in model.parameters():
@@ -68,7 +61,6 @@ def load_dino(dino_ckpt: Path, device: torch.device, img_size: int = 384):
 
 
 def build_eval_transform(crop_size: int = 384) -> transforms.Compose:
-    """Mirrors dino_training/dataset.py::EmbryoFeatureDataset transform."""
     return transforms.Compose([
         transforms.Resize(int(crop_size * 256 / 224),
                           interpolation=transforms.InterpolationMode.BICUBIC),
@@ -78,9 +70,56 @@ def build_eval_transform(crop_size: int = 384) -> transforms.Compose:
     ])
 
 
+class FeatureExtractor:
+    """Produce a per-frame feature tensor from a frozen ViT according to `source`.
+
+    Layer indices are 0-based over `model.blocks` (depth=12, so 0..11). Patch
+    pooling averages the token sequence after dropping the CLS token at idx 0.
+    """
+
+    def __init__(self, model, source: str = "multi_layer", layers=(5, 7, 9, 11)):
+        self.model = model
+        self.source = source
+        self.layers = list(layers)
+        self._captured: dict[int, torch.Tensor] = {}
+        self._handles = []
+
+        if source == "multi_layer":
+            for li in self.layers:
+                def _make_hook(idx):
+                    def _hook(_module, _inp, out):
+                        self._captured[idx] = out
+                    return _hook
+                self._handles.append(
+                    model.blocks[li].register_forward_hook(_make_hook(li))
+                )
+
+    @property
+    def feature_dim(self) -> int:
+        if self.source == "multi_layer":
+            return 384 * len(self.layers)
+        return 384
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        if self.source == "cls":
+            return self.model(x)  # (B, 384)
+        if self.source == "patch_mean":
+            tokens = self.model(x, return_all_tokens=True)  # (B, 1+P, 384)
+            return tokens[:, 1:].mean(dim=1)
+        if self.source == "multi_layer":
+            self._captured.clear()
+            _ = self.model(x)  # triggers hooks
+            pooled = [self._captured[li][:, 1:].mean(dim=1) for li in self.layers]
+            return torch.cat(pooled, dim=-1)  # (B, 384*L)
+        raise ValueError(f"unknown feature source: {self.source}")
+
+    def close(self):
+        for h in self._handles:
+            h.remove()
+        self._handles.clear()
+
+
 def sample_frame_indices(total: int, num_frames: int, stride: int) -> tuple[list[int], int]:
-    """Fixed-stride sampling. Indices past EOS are clamped; caller treats those
-    positions as padding via the returned `real` count."""
     idxs = [i * stride for i in range(num_frames)]
     real = sum(1 for i in idxs if i < total)
     idxs = [min(i, max(total - 1, 0)) for i in idxs]
@@ -88,7 +127,8 @@ def sample_frame_indices(total: int, num_frames: int, stride: int) -> tuple[list
 
 
 def extract_one(video_path: Path, num_frames: int, stride: int,
-                transform, model, device, crop_size: int) -> tuple[torch.Tensor, torch.Tensor]:
+                transform, extractor: FeatureExtractor, device,
+                crop_size: int) -> tuple[torch.Tensor, torch.Tensor]:
     video, _, _ = read_video(str(video_path), pts_unit="sec", output_format="THWC")
     total = video.shape[0]
     if total == 0:
@@ -107,7 +147,7 @@ def extract_one(video_path: Path, num_frames: int, stride: int,
     batch = torch.stack(tensors, dim=0).to(device, non_blocking=True)  # (N, 3, S, S)
 
     with torch.no_grad():
-        feats = model(batch)  # (N, 384) — CLS token (return_all_tokens=False)
+        feats = extractor(batch)  # (N, feature_dim)
     mask = torch.zeros(num_frames, dtype=torch.bool)
     mask[:real] = True
     return feats.cpu(), mask
@@ -118,12 +158,14 @@ def main() -> None:
     ap.add_argument("--manifest", type=Path, default=Path("data/manifest.csv"))
     ap.add_argument("--features-dir", type=Path, default=Path("features"))
     ap.add_argument("--dino-ckpt", type=Path, required=True)
-    ap.add_argument("--dino-training-root", type=Path, default=None,
-                    help="Path whose child is the dino_training/ package; prepended to sys.path")
+    ap.add_argument("--dino-training-root", type=Path, default=None)
     ap.add_argument("--num-frames", type=int, default=40)
     ap.add_argument("--stride", type=int, default=10)
-    ap.add_argument("--crop-size", type=int, default=384,
-                    help="Must match DINOConfig.global_crop_size used during pretraining")
+    ap.add_argument("--crop-size", type=int, default=384)
+    ap.add_argument("--feature-source", choices=["cls", "patch_mean", "multi_layer"],
+                    default="multi_layer")
+    ap.add_argument("--layers", type=str, default="5,7,9,11",
+                    help="Comma-separated block indices for --feature-source multi_layer")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = ap.parse_args()
 
@@ -133,6 +175,10 @@ def main() -> None:
     args.features_dir.mkdir(parents=True, exist_ok=True)
     device = torch.device(args.device)
     model = load_dino(args.dino_ckpt, device, img_size=args.crop_size)
+
+    layers = [int(x) for x in args.layers.split(",") if x.strip()]
+    extractor = FeatureExtractor(model, source=args.feature_source, layers=layers)
+    print(f"[extract] source={args.feature_source} layers={layers} feature_dim={extractor.feature_dim}")
     transform = build_eval_transform(crop_size=args.crop_size)
 
     df = pd.read_csv(args.manifest)
@@ -143,12 +189,20 @@ def main() -> None:
         try:
             feats, mask = extract_one(
                 Path(row["video_path"]), args.num_frames, args.stride,
-                transform, model, device, args.crop_size,
+                transform, extractor, device, args.crop_size,
             )
         except Exception as e:
             print(f"[err] {row['embryo_id']}: {e}")
             continue
-        torch.save({"features": feats, "mask": mask, "label": int(row["label"])}, out)
+        torch.save({
+            "features": feats,
+            "mask": mask,
+            "label": int(row["label"]),
+            "source": args.feature_source,
+            "layers": layers if args.feature_source == "multi_layer" else None,
+        }, out)
+
+    extractor.close()
 
 
 if __name__ == "__main__":

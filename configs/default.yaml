@@ -5,7 +5,7 @@ data:
   features_dir: features
   num_frames: 40           # frames sampled per clip
   frame_stride: 10         # take every Nth frame; pad with black if clip too short
-  feature_dim: 384
+  feature_dim: 1536        # 384 * 4 for multi_layer pool at (5,7,9,11); set 384 for cls or patch_mean
 
 model:
   d_model: 192
